@@ -53,6 +53,8 @@ create table if not exists party_revenues (
   category_id uuid references revenue_categories(id),
   description text,
   amount numeric not null default 0,
+  cash_amount numeric not null default 0,
+  credit_amount numeric not null default 0,
   created_at timestamptz default now()
 );
 
@@ -80,7 +82,10 @@ create table if not exists party_stock (
   id uuid primary key default uuid_generate_v4(),
   party_id uuid references parties(id) on delete cascade,
   product_id uuid references products(id),
-  quantity_sold integer not null default 0,
+  start_qty numeric not null default 0,
+  end_qty numeric not null default 0,
+  price numeric not null default 0,
+  quantity_sold numeric not null default 0,
   revenue numeric not null default 0,
   cost numeric not null default 0,
   created_at timestamptz default now()
@@ -115,3 +120,8 @@ begin
     ', t);
   end loop;
 end $$;
+
+-- Seed the three fixed revenue categories
+insert into revenue_categories (name)
+select v.name from (values ('כניסה'), ('מלצריות'), ('בר')) as v(name)
+where not exists (select 1 from revenue_categories rc where rc.name = v.name);

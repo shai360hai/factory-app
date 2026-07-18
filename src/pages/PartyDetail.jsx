@@ -1,60 +1,85 @@
 import { useEffect, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { supabase } from '../lib/supabaseClient'
-import { computePartyTotals, formatMoney } from '../lib/calc'
+import { formatMoney } from '../lib/calc'
+
+const FIXED_CATEGORY_NAMES = ['כניסה', 'מלצריות', 'בר']
 
 export default function PartyDetail() {
   const { id } = useParams()
   const [party, setParty] = useState(null)
   const [revenues, setRevenues] = useState([])
-  const [entries, setEntries] = useState([])
   const [expenses, setExpenses] = useState([])
   const [stock, setStock] = useState([])
-  const [categories, setCategories] = useState([])
-  const [tiers, setTiers] = useState([])
   const [templates, setTemplates] = useState([])
-  const [products, setProducts] = useState([])
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(true)
+  const [pickedTemplate, setPickedTemplate] = useState('')
+
+  async function ensureFixedRows(partyId, cats, prods) {
+    // Ensure the 3 fixed revenue categories each have a row for this party
+    const { data: existingRev } = await supabase.from('party_revenues').select('category_id').eq('party_id', partyId)
+    const existingCatIds = new Set((existingRev || []).map(r => r.category_id))
+    const missingCats = cats.filter(c => FIXED_CATEGORY_NAMES.includes(c.name) && !existingCatIds.has(c.id))
+    if (missingCats.length > 0) {
+      await supabase.from('party_revenues').insert(
+        missingCats.map(c => ({ party_id: partyId, category_id: c.id, description: c.name, amount: 0, cash_amount: 0, credit_amount: 0 }))
+      )
+    }
+
+    // Ensure every product has a fixed stock row for this party
+    const { data: existingStock } = await supabase.from('party_stock').select('product_id').eq('party_id', partyId)
+    const existingProdIds = new Set((existingStock || []).map(s => s.product_id))
+    const missingProds = prods.filter(p => !existingProdIds.has(p.id))
+    if (missingProds.length > 0) {
+      await supabase.from('party_stock').insert(
+        missingProds.map(p => ({ party_id: partyId, product_id: p.id, start_qty: 0, end_qty: 0, price: p.sale_price || 0, quantity_sold: 0, revenue: 0, cost: 0 }))
+      )
+    }
+  }
 
   async function load() {
     setLoading(true)
     setError('')
-    const [
-      { data: p, error: pErr },
-      { data: rev }, { data: ent }, { data: exp }, { data: stk },
-      { data: cats }, { data: tiersData }, { data: tpls }, { data: prods },
-    ] = await Promise.all([
+    const [{ data: p, error: pErr }, { data: cats }, { data: prods }] = await Promise.all([
       supabase.from('parties').select('*').eq('id', id).single(),
-      supabase.from('party_revenues').select('*').eq('party_id', id),
-      supabase.from('party_entries').select('*, entry_tiers(name, price)').eq('party_id', id),
-      supabase.from('party_expenses').select('*').eq('party_id', id),
-      supabase.from('party_stock').select('*, products(name)').eq('party_id', id),
       supabase.from('revenue_categories').select('*'),
-      supabase.from('entry_tiers').select('*'),
-      supabase.from('expense_templates').select('*'),
       supabase.from('products').select('*'),
     ])
     if (pErr) { setError(pErr.message); setLoading(false); return }
+
+    await ensureFixedRows(id, cats || [], prods || [])
+
+    const [{ data: rev }, { data: exp }, { data: stk }, { data: tpls }] = await Promise.all([
+      supabase.from('party_revenues').select('*, revenue_categories(name)').eq('party_id', id),
+      supabase.from('party_expenses').select('*').eq('party_id', id),
+      supabase.from('party_stock').select('*, products(name, cost_price)').eq('party_id', id),
+      supabase.from('expense_templates').select('*'),
+    ])
     setParty(p)
     setRevenues(rev || [])
-    setEntries(ent || [])
     setExpenses(exp || [])
     setStock(stk || [])
-    setCategories(cats || [])
-    setTiers(tiersData || [])
     setTemplates(tpls || [])
-    setProducts(prods || [])
     setLoading(false)
   }
 
   useEffect(() => { load() }, [id])
 
-  async function addRevenue() {
-    await supabase.from('party_revenues').insert({ party_id: id, description: 'הכנסה', amount: 0 })
+  // ---- Revenue (cash/credit) ----
+  async function updateRevenueCashCredit(rid, field, value) {
+    const row = revenues.find(r => r.id === rid)
+    const cash = field === 'cash_amount' ? value : Number(row.cash_amount || 0)
+    const credit = field === 'credit_amount' ? value : Number(row.credit_amount || 0)
+    await supabase.from('party_revenues').update({ [field]: value, amount: cash + credit }).eq('id', rid)
     load()
   }
-  async function updateRevenue(rid, field, value) {
+
+  async function addExtraRevenue() {
+    await supabase.from('party_revenues').insert({ party_id: id, description: 'הכנסה נוספת', amount: 0, cash_amount: 0, credit_amount: 0 })
+    load()
+  }
+  async function updateRevenueField(rid, field, value) {
     await supabase.from('party_revenues').update({ [field]: value }).eq('id', rid)
     load()
   }
@@ -63,22 +88,17 @@ export default function PartyDetail() {
     load()
   }
 
-  async function addEntry() {
-    if (tiers.length === 0) { alert('אין מחירי כניסה מוגדרים. הוסף בעמוד "מחירי כניסה".'); return }
-    await supabase.from('party_entries').insert({ party_id: id, tier_id: tiers[0].id, count: 0 })
-    load()
-  }
-  async function updateEntry(eid, field, value) {
-    await supabase.from('party_entries').update({ [field]: value }).eq('id', eid)
-    load()
-  }
-  async function removeEntry(eid) {
-    await supabase.from('party_entries').delete().eq('id', eid)
-    load()
-  }
-
+  // ---- Expenses ----
   async function addExpense() {
     await supabase.from('party_expenses').insert({ party_id: id, name: 'הוצאה', amount: 0 })
+    load()
+  }
+  async function addFixedExpense() {
+    if (!pickedTemplate) return
+    const tpl = templates.find(t => t.id === pickedTemplate)
+    if (!tpl) return
+    await supabase.from('party_expenses').insert({ party_id: id, template_id: tpl.id, name: tpl.name, amount: tpl.default_amount || 0 })
+    setPickedTemplate('')
     load()
   }
   async function updateExpense(xid, field, value) {
@@ -90,17 +110,16 @@ export default function PartyDetail() {
     load()
   }
 
-  async function addStock() {
-    if (products.length === 0) { alert('אין מוצרים מוגדרים. הוסף בעמוד "מוצרים".'); return }
-    await supabase.from('party_stock').insert({ party_id: id, product_id: products[0].id, quantity_sold: 0, revenue: 0, cost: 0 })
-    load()
-  }
+  // ---- Stock (start/end qty + price) ----
   async function updateStock(sid, field, value) {
-    await supabase.from('party_stock').update({ [field]: value }).eq('id', sid)
-    load()
-  }
-  async function removeStock(sid) {
-    await supabase.from('party_stock').delete().eq('id', sid)
+    const row = stock.find(s => s.id === sid)
+    const start = field === 'start_qty' ? value : Number(row.start_qty || 0)
+    const end = field === 'end_qty' ? value : Number(row.end_qty || 0)
+    const price = field === 'price' ? value : Number(row.price || 0)
+    const sold = Math.max(0, start - end)
+    const revenue = sold * price
+    const cost = sold * Number(row.products?.cost_price || 0)
+    await supabase.from('party_stock').update({ [field]: value, quantity_sold: sold, revenue, cost }).eq('id', sid)
     load()
   }
 
@@ -108,12 +127,15 @@ export default function PartyDetail() {
   if (error) return <div className="main"><div className="error-box">{error}</div></div>
   if (!party) return null
 
-  const totals = computePartyTotals({
-    revenues,
-    entries: entries.map(e => ({ count: e.count, tier_price: e.entry_tiers?.price })),
-    expenses,
-    stock,
-  })
+  const fixedRevenues = revenues.filter(r => FIXED_CATEGORY_NAMES.includes(r.revenue_categories?.name))
+  const extraRevenues = revenues.filter(r => !FIXED_CATEGORY_NAMES.includes(r.revenue_categories?.name))
+
+  const revenueTotal = revenues.reduce((s, r) => s + Number(r.cash_amount || 0) + Number(r.credit_amount || 0), 0)
+  const expenseTotal = expenses.reduce((s, e) => s + Number(e.amount || 0), 0)
+  const stockCost = stock.reduce((s, r) => s + Number(r.cost || 0), 0)
+  const stockRevenue = stock.reduce((s, r) => s + Number(r.revenue || 0), 0)
+  const stockNet = stockCost - stockRevenue
+  const profit = revenueTotal - expenseTotal - stockNet
 
   return (
     <div className="main">
@@ -126,103 +148,99 @@ export default function PartyDetail() {
       </div>
 
       <div className="summary-cards">
-        <div className="card"><div className="label">הכנסות</div><div className="value">{formatMoney(totals.income)}</div></div>
-        <div className="card"><div className="label">הוצאות</div><div className="value">{formatMoney(totals.expenses)}</div></div>
-        <div className="card"><div className="label">סחורה (נטו)</div><div className="value">{formatMoney(-totals.stockNet)}</div></div>
-        <div className="card"><div className="label">רווח</div><div className={'value ' + (totals.profit >= 0 ? 'pos' : 'neg')}>{formatMoney(totals.profit)}</div></div>
+        <div className="card"><div className="label">הכנסות</div><div className="value">{formatMoney(revenueTotal)}</div></div>
+        <div className="card"><div className="label">הוצאות</div><div className="value">{formatMoney(expenseTotal)}</div></div>
+        <div className="card"><div className="label">סחורה (נטו)</div><div className="value">{formatMoney(-stockNet)}</div></div>
+        <div className="card"><div className="label">רווח</div><div className={'value ' + (profit >= 0 ? 'pos' : 'neg')}>{formatMoney(profit)}</div></div>
       </div>
 
-      {/* Revenue */}
+      {/* Fixed revenue: כניסה / מלצריות / בר, each with cash + credit */}
       <div className="card">
-        <div className="card-header"><div className="title">הכנסות</div><button className="btn secondary" onClick={addRevenue}>+ הוסף</button></div>
+        <div className="card-header"><div className="title">הכנסות</div></div>
         <table>
-          <thead><tr><th>תיאור</th><th>קטגוריה</th><th>סכום</th><th></th></tr></thead>
+          <thead><tr><th>קטגוריה</th><th>מזומן</th><th>אשראי</th><th>סה״כ</th></tr></thead>
           <tbody>
-            {revenues.map(r => (
+            {fixedRevenues.map(r => (
               <tr key={r.id}>
-                <td><input defaultValue={r.description || ''} onBlur={e => updateRevenue(r.id, 'description', e.target.value)} /></td>
-                <td>
-                  <select defaultValue={r.category_id || ''} onChange={e => updateRevenue(r.id, 'category_id', e.target.value || null)}>
-                    <option value="">—</option>
-                    {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  </select>
-                </td>
-                <td><input type="number" step="0.01" defaultValue={r.amount} onBlur={e => updateRevenue(r.id, 'amount', Number(e.target.value))} /></td>
-                <td><button className="btn secondary" onClick={() => removeRevenue(r.id)}>מחק</button></td>
+                <td>{r.revenue_categories?.name}</td>
+                <td><input type="number" step="0.01" defaultValue={r.cash_amount} onBlur={e => updateRevenueCashCredit(r.id, 'cash_amount', Number(e.target.value))} /></td>
+                <td><input type="number" step="0.01" defaultValue={r.credit_amount} onBlur={e => updateRevenueCashCredit(r.id, 'credit_amount', Number(e.target.value))} /></td>
+                <td>{formatMoney(Number(r.cash_amount || 0) + Number(r.credit_amount || 0))}</td>
               </tr>
             ))}
-            {revenues.length === 0 && <tr><td colSpan={4} className="empty">אין שורות הכנסה</td></tr>}
           </tbody>
         </table>
-      </div>
 
-      {/* Entries / tickets */}
-      <div className="card">
-        <div className="card-header"><div className="title">כניסות (כרטיסים)</div><button className="btn secondary" onClick={addEntry}>+ הוסף</button></div>
-        <table>
-          <thead><tr><th>שכבת מחיר</th><th>כמות</th><th>סה״כ</th><th></th></tr></thead>
-          <tbody>
-            {entries.map(en => (
-              <tr key={en.id}>
-                <td>
-                  <select defaultValue={en.tier_id} onChange={e => updateEntry(en.id, 'tier_id', e.target.value)}>
-                    {tiers.map(t => <option key={t.id} value={t.id}>{t.name} ({formatMoney(t.price)})</option>)}
-                  </select>
-                </td>
-                <td><input type="number" defaultValue={en.count} onBlur={e => updateEntry(en.id, 'count', Number(e.target.value))} /></td>
-                <td>{formatMoney((en.count || 0) * (en.entry_tiers?.price || 0))}</td>
-                <td><button className="btn secondary" onClick={() => removeEntry(en.id)}>מחק</button></td>
-              </tr>
-            ))}
-            {entries.length === 0 && <tr><td colSpan={4} className="empty">אין כניסות</td></tr>}
-          </tbody>
-        </table>
+        {extraRevenues.length > 0 && (
+          <>
+            <div style={{ marginTop: 14, marginBottom: 6, color: 'var(--text-dim)', fontSize: 13 }}>הכנסות נוספות</div>
+            <table>
+              <thead><tr><th>תיאור</th><th>מזומן</th><th>אשראי</th><th>סה״כ</th><th></th></tr></thead>
+              <tbody>
+                {extraRevenues.map(r => (
+                  <tr key={r.id}>
+                    <td><input defaultValue={r.description || ''} onBlur={e => updateRevenueField(r.id, 'description', e.target.value)} /></td>
+                    <td><input type="number" step="0.01" defaultValue={r.cash_amount} onBlur={e => updateRevenueCashCredit(r.id, 'cash_amount', Number(e.target.value))} /></td>
+                    <td><input type="number" step="0.01" defaultValue={r.credit_amount} onBlur={e => updateRevenueCashCredit(r.id, 'credit_amount', Number(e.target.value))} /></td>
+                    <td>{formatMoney(Number(r.cash_amount || 0) + Number(r.credit_amount || 0))}</td>
+                    <td><button className="btn secondary" onClick={() => removeRevenue(r.id)}>מחק</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </>
+        )}
+
+        <div style={{ marginTop: 10 }}>
+          <button className="btn secondary" onClick={addExtraRevenue}>+ קטגוריית הכנסה נוספת</button>
+        </div>
       </div>
 
       {/* Expenses */}
       <div className="card">
-        <div className="card-header"><div className="title">הוצאות</div><button className="btn secondary" onClick={addExpense}>+ הוסף</button></div>
+        <div className="card-header">
+          <div className="title">הוצאות</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <select value={pickedTemplate} onChange={e => setPickedTemplate(e.target.value)} style={{ width: 180 }}>
+              <option value="">בחר הוצאה קבועה…</option>
+              {templates.map(t => <option key={t.id} value={t.id}>{t.name} ({formatMoney(t.default_amount)})</option>)}
+            </select>
+            <button className="btn secondary" onClick={addFixedExpense} disabled={!pickedTemplate}>+ הוסף קבועה</button>
+            <button className="btn secondary" onClick={addExpense}>+ הוצאה חופשית</button>
+          </div>
+        </div>
         <table>
-          <thead><tr><th>שם</th><th>תבנית</th><th>סכום</th><th></th></tr></thead>
+          <thead><tr><th>שם</th><th>סכום</th><th></th></tr></thead>
           <tbody>
             {expenses.map(x => (
               <tr key={x.id}>
                 <td><input defaultValue={x.name || ''} onBlur={e => updateExpense(x.id, 'name', e.target.value)} /></td>
-                <td>
-                  <select defaultValue={x.template_id || ''} onChange={e => updateExpense(x.id, 'template_id', e.target.value || null)}>
-                    <option value="">—</option>
-                    {templates.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
-                  </select>
-                </td>
                 <td><input type="number" step="0.01" defaultValue={x.amount} onBlur={e => updateExpense(x.id, 'amount', Number(e.target.value))} /></td>
                 <td><button className="btn secondary" onClick={() => removeExpense(x.id)}>מחק</button></td>
               </tr>
             ))}
-            {expenses.length === 0 && <tr><td colSpan={4} className="empty">אין הוצאות</td></tr>}
+            {expenses.length === 0 && <tr><td colSpan={3} className="empty">אין הוצאות</td></tr>}
           </tbody>
         </table>
       </div>
 
-      {/* Stock */}
+      {/* Stock: fixed row per product, start/end qty + price */}
       <div className="card">
-        <div className="card-header"><div className="title">סחורה</div><button className="btn secondary" onClick={addStock}>+ הוסף</button></div>
+        <div className="card-header"><div className="title">סחורה</div></div>
         <table>
-          <thead><tr><th>מוצר</th><th>כמות</th><th>הכנסה</th><th>עלות</th><th></th></tr></thead>
+          <thead><tr><th>מוצר</th><th>כמות התחלה</th><th>כמות סיום</th><th>מחיר</th><th>נמכר</th><th>הכנסה</th></tr></thead>
           <tbody>
             {stock.map(s => (
               <tr key={s.id}>
-                <td>
-                  <select defaultValue={s.product_id} onChange={e => updateStock(s.id, 'product_id', e.target.value)}>
-                    {products.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                  </select>
-                </td>
-                <td><input type="number" defaultValue={s.quantity_sold} onBlur={e => updateStock(s.id, 'quantity_sold', Number(e.target.value))} /></td>
-                <td><input type="number" step="0.01" defaultValue={s.revenue} onBlur={e => updateStock(s.id, 'revenue', Number(e.target.value))} /></td>
-                <td><input type="number" step="0.01" defaultValue={s.cost} onBlur={e => updateStock(s.id, 'cost', Number(e.target.value))} /></td>
-                <td><button className="btn secondary" onClick={() => removeStock(s.id)}>מחק</button></td>
+                <td>{s.products?.name}</td>
+                <td><input type="number" defaultValue={s.start_qty} onBlur={e => updateStock(s.id, 'start_qty', Number(e.target.value))} /></td>
+                <td><input type="number" defaultValue={s.end_qty} onBlur={e => updateStock(s.id, 'end_qty', Number(e.target.value))} /></td>
+                <td><input type="number" step="0.01" defaultValue={s.price} onBlur={e => updateStock(s.id, 'price', Number(e.target.value))} /></td>
+                <td>{s.quantity_sold}</td>
+                <td>{formatMoney(s.revenue)}</td>
               </tr>
             ))}
-            {stock.length === 0 && <tr><td colSpan={5} className="empty">אין סחורה</td></tr>}
+            {stock.length === 0 && <tr><td colSpan={6} className="empty">אין מוצרים מוגדרים — הוסף מוצרים בעמוד "מוצרים"</td></tr>}
           </tbody>
         </table>
       </div>
